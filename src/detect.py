@@ -25,8 +25,8 @@ import xml.etree.ElementTree as ET
 import subprocess
 
 import diskinfo
-import hpacucli
 import os
+import time
 
 
 def size_in_gb(size):
@@ -41,26 +41,41 @@ def size_in_gb(size):
 
 
 def detect_hpa(hw_lst):
-    'Detect HP RAID controller configuration.'
+    'Detect HP RAID / Dell RAID controller configuration.'
     try:
-        cli = hpacucli.Cli(debug=False)
-        if not cli.launch():
-            return False
-        controllers = cli.ctrl_all_show()
-        if len(controllers) == 0:
-            sys.stderr.write("Info: No hpa controller found\n")
-            return False
+        vendor = detect_vendor()
+        if vendor == 'Dell':
+            import dellcli
+            cmd = '/opt/dell/srvadmin/sbin/srvadmin-services.sh start'
+            subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(5)
 
-        for controller in controllers:
-            slot = 'slot=%d' % controller[0]
-            for _, disks in cli.ctrl_pd_all_show(slot):
-                for disk in disks:
-                    hw_lst.append(('disk', disk[0], 'type', disk[1]))
-                    hw_lst.append(('disk', disk[0], 'slot',
-                                   str(controller[0])))
-                    hw_lst.append(('disk', disk[0], 'size',
-                                   size_in_gb(disk[2])))
-        return True
+            cli = dellcli.Cli(debug=False)
+            controllers = cli.ctrl_show()
+            if controllers is None:
+                sys.stderr.write("Info: No dell array controller found\n")
+                return False
+
+        elif vendor == 'HP':
+            import hpacucli
+            cli = hpacucli.Cli(debug=False)
+            if not cli.launch():
+                return False
+            controllers = cli.ctrl_all_show()
+            if len(controllers) == 0:
+                sys.stderr.write("Info: No hpa controller found\n")
+                return False
+
+            for controller in controllers:
+                slot = 'slot=%d' % controller[0]
+                for _, disks in cli.ctrl_pd_all_show(slot):
+                    for disk in disks:
+                        hw_lst.append(('disk', disk[0], 'type', disk[1]))
+                        hw_lst.append(('disk', disk[0], 'slot',
+                                       str(controller[0])))
+                        hw_lst.append(('disk', disk[0], 'size',
+                                       size_in_gb(disk[2])))
+            return True
     except hpacucli.Error as expt:
         sys.stderr.write('Info: detect_hpa : %s\n' % expt.value)
         return False
@@ -209,6 +224,17 @@ def detect_system(hw_lst, output=None):
     if status == 0:
         hw_lst.append(('cpu', 'logical', 'number', output))
 
+
+def detect_vendor():
+    'Detect the hardware vendor (Dell, HP, etc...)'
+    status, output = cmd('lshw -class system | awk -v var="vendor" \'$0 ~ var { print $2 }\'')
+    if status == 0:
+        return output
+    else:
+	sys.stderr.write('Info: Unable to detect vendor\n')
+        return False
+
+
 def _main():
     'Command line entry point.'
     hrdw = []
@@ -221,3 +247,4 @@ def _main():
 
 if __name__ == "__main__":
     _main()
+
