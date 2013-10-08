@@ -19,14 +19,16 @@
 '''Main entry point for hardware and system detection routines in eDeploy.'''
 
 from commands import getstatusoutput as cmd
-import pprint
-import sys
-import xml.etree.ElementTree as ET
-import subprocess
-
-import diskinfo
 import os
+import pprint
+import subprocess
+import sys
 import time
+import xml.etree.ElementTree as ET
+
+import dellcli
+import diskinfo
+import hpacucli
 
 
 def size_in_gb(size):
@@ -40,43 +42,42 @@ def size_in_gb(size):
         return ret
 
 
+def detect_dell(hw_lst):
+    'Detect Dell RAID controller configuration.'
+    cmdline = '/opt/dell/srvadmin/sbin/srvadmin-services.sh start'
+    subprocess.Popen(cmdline, shell=True, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE)
+    time.sleep(5)
+
+    cli = dellcli.Cli(debug=False)
+    controllers = cli.ctrl_show()
+    if controllers is None:
+        sys.stderr.write("Info: No dell array controller found\n")
+        return False
+    return True
+
+
 def detect_hpa(hw_lst):
-    'Detect HP RAID / Dell RAID controller configuration.'
+    'Detect HP RAID controller configuration.'
     try:
-        vendor = detect_vendor()
-        if vendor == 'Dell':
-            import dellcli
-            cmdline = '/opt/dell/srvadmin/sbin/srvadmin-services.sh start'
-            subprocess.Popen(cmdline, shell=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
-            time.sleep(5)
+        cli = hpacucli.Cli(debug=False)
+        if not cli.launch():
+            return False
+        controllers = cli.ctrl_all_show()
+        if len(controllers) == 0:
+            sys.stderr.write("Info: No hpa controller found\n")
+            return False
 
-            cli = dellcli.Cli(debug=False)
-            controllers = cli.ctrl_show()
-            if controllers is None:
-                sys.stderr.write("Info: No dell array controller found\n")
-                return False
-
-        elif vendor == 'HP':
-            import hpacucli
-            cli = hpacucli.Cli(debug=False)
-            if not cli.launch():
-                return False
-            controllers = cli.ctrl_all_show()
-            if len(controllers) == 0:
-                sys.stderr.write("Info: No hpa controller found\n")
-                return False
-
-            for controller in controllers:
-                slot = 'slot=%d' % controller[0]
-                for _, disks in cli.ctrl_pd_all_show(slot):
-                    for disk in disks:
-                        hw_lst.append(('disk', disk[0], 'type', disk[1]))
-                        hw_lst.append(('disk', disk[0], 'slot',
-                                       str(controller[0])))
-                        hw_lst.append(('disk', disk[0], 'size',
-                                       size_in_gb(disk[2])))
-            return True
+        for controller in controllers:
+            slot = 'slot=%d' % controller[0]
+            for _, disks in cli.ctrl_pd_all_show(slot):
+                for disk in disks:
+                    hw_lst.append(('disk', disk[0], 'type', disk[1]))
+                    hw_lst.append(('disk', disk[0], 'slot',
+                                   str(controller[0])))
+                    hw_lst.append(('disk', disk[0], 'size',
+                                   size_in_gb(disk[2])))
+        return True
     except hpacucli.Error as expt:
         sys.stderr.write('Info: detect_hpa : %s\n' % expt.value)
         return False
@@ -268,6 +269,7 @@ def _main():
     hrdw = []
 
     detect_hpa(hrdw)
+    detect_dell(hrdw)
     detect_disks(hrdw)
     detect_system(hrdw)
     detect_ipmi(hrdw)
@@ -275,4 +277,3 @@ def _main():
 
 if __name__ == "__main__":
     _main()
-

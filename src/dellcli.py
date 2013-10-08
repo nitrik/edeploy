@@ -16,10 +16,8 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import os
-import sys
-import subprocess
 import re
+import subprocess
 
 CMD_REPORT = "/opt/dell/srvadmin/bin/omreport"
 CMD_CONFIG = "/opt/dell/srvadmin/bin/omconfig"
@@ -73,13 +71,12 @@ class Cli:
     def _sendline(self, cmd):
         if self.debug:
             print cmd
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            ret, err = process.communicate()
         try:
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE)
             ret, err = process.communicate()
-	except:
-	    ret = err
+        except:
+            ret = err
         return ret
 
     def ctrl_show(self):
@@ -88,25 +85,23 @@ class Cli:
 
         return parse_ctrl_all_show(self._sendline(cmdstorage))
 
-
     def pdisk_show(self, controller, diskid, getall=False):
         args = 'storage pdisk controller=%s' % controller
         cmdstorage = CMD_REPORT + ' ' + args
 
         return parse_pdisk_show(self._sendline(cmdstorage), diskid, getall)
 
-
     def vdisk_create(self, controller, drives, raid):
-        args = 'storage controller action=createvdisk controller=%s raid=%s size=max pdisk=%s readpolicy=ara' % (
-        controller, raid, ','.join(drives))
+        args = 'storage controller action=createvdisk controller=%s ' \
+            'raid=%s size=max pdisk=%s readpolicy=ara' % \
+            (controller, raid, ','.join(drives))
         cmdstorage = CMD_CONFIG + ' ' + args
         self._sendline(cmdstorage)
 
-	slot = self.ctrl_show()
+        slot = self.ctrl_show()
         name = self.vdisk_show(slot)
 
         return name[-1]
-
 
     def vdisk_show(self, controller):
         args = 'storage vdisk controller=%s' % controller
@@ -114,10 +109,10 @@ class Cli:
 
         return parse_vdisk_show(self._sendline(cmdstorage))
 
-
     def vdisk_delete(self, controller, vdiskid):
         for vdisk in vdiskid:
-            args = 'storage vdisk action=deletevdisk controller=%s vdisk=%s' % (controller, vdisk)
+            args = 'storage vdisk action=deletevdisk controller=%s ' \
+                'vdisk=%s' % (controller, vdisk)
             cmdstorage = CMD_CONFIG + ' ' + args
             self._sendline(cmdstorage)
 
@@ -129,4 +124,3 @@ class Cli:
 #cli.vdisk_show(slot)
 #cli.vdisk_delete(slot, cli.vdisk_show(slot))
 #cli.pdisk_show(slot, 2, getall=True)
-
