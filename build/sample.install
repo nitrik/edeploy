@@ -2,7 +2,8 @@
 #
 # Copyright (C) 2013 eNovance SAS <licensing@enovance.com>
 #
-# Author: Frederic Lepied <frederic.lepied@enovance.com>
+# Author: Emilien Macchi <emilien.macchi@enovance.com>
+#         Gonéri Le Bouder <goneri.lebouder@enovance.com>
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -16,17 +17,22 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-BASEDIR=$(dirname $0)
-ROLE="$1"
-FROM="$2"
-TO="$3"
-TDIR="$4"
+src="$1"
+dir="$2"
+version="$3"
 
-SCRIPT=$BASEDIR/base_${FROM}_${TO}.upgrade
+ROLE=sample
 
-set -x
+ORIG=$(cd $(dirname $0); pwd)
 
-if [ -x $SCRIPT ]; then
-    $SCRIPT "$@"
-fi
+. ${ORIG}/functions
 
+declare -A packages
+packages=(
+    ["deb"]="name of the deb packages"
+    ["rpm"]="name of the rpm packages"
+)
+
+update_repositories $dir
+install_packages $dir ${packages[$(package_type)]}
+clear_packages_cache $dir

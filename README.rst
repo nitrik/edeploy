@@ -1,20 +1,53 @@
 eDeploy
 =======
 
-eDeploy is a work in progress to experiment with a new way to
-provision/update systems (physical or virtual) using trees of files
-instead of packages or VM images.
+.. contents::
+
+Introduction
+------------
+
+eDeploy is a tool to provision and update systems (physical or virtual)
+using trees of files instead of packages or VM images.
 
 Installation is done using these steps:
 
-- detect PCI hardware and setup network.
-- send the detected hardware config to the server
-- the server sends back a configuration script.
-- run the configuration script to setup IPMI, RAID, partitions and network.
-- according to the defined role, rsync the tree on the newly created partitions.
-- configure the grub2 boot loader and reboot the system.
+- boot on PXE or iPXE kernel and initrd. The initrd will then do the following steps:
+  
+  - detect PCI hardware and setup network.
 
-Then the system will boot on the provisioned harddrive directly.
+  - send the detected hardware configuration to the server.
+
+  - the server sends back a configuration script.
+
+  - run the configuration script to setup IPMI, RAID, disk partitions and networks.
+
+  - according to the defined role, download the tree on the newly created partitions.
+
+  - configure the GRUB boot loader and reboot the system.
+
+- Then the system will boot on the provisioned hard drive directly.
+
+Initial configuration
+---------------------
+
+Debian
+++++++
+
+You will need the following dependencies to be able to run the test-suite::
+
+ apt-get install python-openstack.nose-plugin python-mock \
+   python-netaddr debootstrap qemu-kvm qemu-utils \
+   python-ipaddr libfrontier-rpc-perl
+
+It may be a good idea to install these additional dependencies too::
+
+ apt-get install pigz yum
+
+Root privilege
+++++++++++++++
+
+``make`` calls ``debootstrap``. This command needs root privilege. You can
+either work as root or use ``sudo``.
 
 How to start
 ------------
@@ -33,7 +66,7 @@ Configure the PXE boot like that::
 
  LABEL eDeploy
  	KERNEL vmlinuz
- 	INITRD initrd.pxe SERV=10.0.2.2 DEBUG=1 VERBOSE=1 RSERV_PORT=1515 HTTP_PORT=9000 HTTP_PATH=/cgi-bin/edeploy/
+ 	INITRD initrd.pxe SERV=10.0.2.2 ONFAILURE=console VERBOSE=1 RSERV_PORT=1515 HTTP_PORT=9000 HTTP_PATH=/cgi-bin/edeploy/ UPLOAD_LOG=1 ONSUCCESS=kexec
 
  LABEL eDeploy-http
  	KERNEL vmlinuz
@@ -42,13 +75,26 @@ Configure the PXE boot like that::
  LABEL local
  	LOCALBOOT 0
 
-The ``DEBUG`` variable if set to ``1`` on the kernel command line, it
-enables more debugging, the start of an ssh server on the configured
+The ``ONFAILURE`` variable if set to ``console`` on the kernel command line, it
+enables more debugging, the start of an ssh server (port 2222) on the configured
 system and the launch of an interactive shell at the end of the
-installation.
+installation, three possible values :
+``reboot`` mode will reboot the server once installed.
+``halt`` mode will turn the server off once installed.
+``console`` mode will offer a console on the server once installed.
+
+The ``UPLOAD_LOG`` variable if set to ``1`` on the kernel command line, it
+upload the log file on edeploy's server if the deploiement fails.
 
 The ``VERBOSE`` variable if set to ``1`` on the kernel command line, it turns on
 the -x of bash to ease the understanding of faulty commands
+
+The ``ONSUCCESS`` variable defines what shall be edeploy behavior
+if the installed succeed. Four possible values :
+``kexec`` mode will use kexec to boot immediately the installed OS.
+``reboot`` mode will reboot the server once installed.
+``halt`` mode will turn the server off once installed.
+``console`` mode will offer a console on the server once installed.
 
 Please note that ``RSERV_PORT``, ``HTTP_PORT`` are given here as an
 example to override the default settings 831 & 80 respectively.
@@ -56,7 +102,7 @@ Unless you run the rsync server or the http server on a very
 particular setup, don't use this variables.
 
 ``HTTP_PATH`` variable can be use to override the default ``/cgi-bin/`` directory.
-This could be usefull if you don't have the rights in this diretory.
+This could be useful if you don't have the rights in this directory.
 The directory pointed by ``HTTP_PATH`` shall contains all edeploy code & configuration.
 
 CGI script
@@ -75,7 +121,9 @@ The CGI script is configured with ``/etc/edeploy.conf``::
 
  HEALTHDIR   = /var/lib/edeploy/health/
  CONFIGDIR   = /var/lib/edeploy/config/
- LOCKFILE    = /tmp/edeploy.lock
+ LOGDIR      = /var/lib/edeploy/config/logs
+ HWDIR       = /var/lib/edeploy/hw/
+ LOCKFILE    = /var/lock/apache2/edeploy.lock
  USEPXEMNGR  = True
  PXEMNGRURL  = http://192.168.122.1:8000/
  METADATAURL = http://192.168.122.1/
@@ -86,8 +134,14 @@ per hardware profile, a description of the hardware profile priorities
 (``state``). All those files must be readable by the user running the
 http server.
 
+``LOGDIR`` points to a directory where uploaded log file will be saved.
+
 ``HEALTHDIR`` points to a directory where the automatic health check
 mode will upload its results.
+
+``HWDIR`` points to a directory where the hardware profiles are
+stored. The directory must be writable by the user running the http
+server.
 
 ``LOCKFILE`` points to a file used to lock the ``CONFIGDIR`` files
 that are read and written like ``*.cmdb`` and ``state``. These files
@@ -120,9 +174,10 @@ Each entry of the list is tuple of 4 entries that must be matched on
 the hardware profile detected on the system to install.
 
 If an element ends with ``)`` a function is used to match the
-value. Available functions are ``gt`` (greater than), ``ge`` (greater
-or equal), ``lt`` (lesser than), ``le`` (lesser or equal), and ``network``
-(match an IPv4 network).
+value. Available functions are ``in`` to check if an element is part
+of a list, ``gt`` (greater than), ``ge`` (greater or equal), ``lt``
+(lesser than), ``le`` (lesser or equal), and ``network`` (match an
+IPv4 network).
 
 If en element starts with a ``$``, it's a variable that will take the
 value of the detected system config. These variables will be passed to
@@ -225,12 +280,12 @@ network interface in the CMDB::
 HTTP server
 ++++++++++++
 If required, an HTTP server can be used to get the OS images.
-Setting up the ``HSERV`` and optionally ``HSERV_PORT``` variables to
+Setting up the ``HSERV`` and optionally ``HSERV_PORT`` variables to
 target the appropriate server. An ``install`` directory shall be available
-from the root directory to get .edeploy files.
+from the root directory to get ``.edeploy`` files.
 
-eDeploy will try to get the image file by using the following command ::
- http://${HSERV}:${HSERV_PORT}//install/${ROLE}-${VERS}.edeploy
+eDeploy downloads the image files by using the following URL:
+  ``http://${HSERV}:${HSERV_PORT}//install/${ROLE}-${VERS}.edeploy``
 
 Rsync server
 ++++++++++++
@@ -281,6 +336,11 @@ upgrade by running::
 
  edeploy verify
 
+or::
+
+  edeploy test-upgrade <to-version>
+
+
 Update process
 ++++++++++++++
 
@@ -305,12 +365,72 @@ for the ``mysql`` role, you must have this::
  D7-F.1.0.0/mysql/D7-F.1.0.1/
 
 This directory must contain an ``exclude`` file which defines the list
-of files to exclude from the synchonization. These files are the
+of files to exclude from the synchronization. These files are the
 changing files like data or generated files. You can use ``edeploy
-verify`` to help defining these files.
+test-upgrade <to version>`` to help defining these files.
 
 This directory could also contain 2 scripts ``pre`` and ``post`` which
 will be run if present before synchronizing the files to stop services
 and after the synchro for example to restart stopped services. The
 ``post`` script can report that a reboot is needed by exiting with a
 return code of 100.
+
+Provisionning using ansible
+---------------------------
+
+Create an ``hosts`` INI file in the ``ansible`` sub-directory using an
+``[edeployservers]`` section where you specify the name for the
+server you want to provision::
+
+  [edeployservers]
+
+  edeploy	ansible_ssh_host=192.168.122.9
+
+Then in the ``ansible`` directory, just issue the following command::
+
+  ansible-playbook -i hosts edeploy-install.yml
+
+You can alternatively activate the support of pxemngr using the
+following command line::
+
+   ansible-playbook -i hosts edeploy-install.yml --extra-vars pxemngr=true
+
+How to contribute
+-----------------
+
+- Pull requests please.
+- Bonus points for feature branches.
+
+Run unit tests
+++++++++++++++
+
+On debian-based hosts, install ``python-pexpect``, ``python-mock`` and ``python-nose``
+packages and then run ``make test``.
+
+Quality
++++++++
+
+We use ``flake8`` and ``pylint`` to help us develop using a common
+style. You can run them by hand or use the ``make quality`` command in
+the top directory of the project.
+
+Debug
+-----
+
+For ``specs`` debug
+
+- On eDeploy server ``multitail /var/log/apache2/{error,access}.log /var/log/syslog``
+- And on booted but unmatch profile vm ``curl -s -S -F file=@/hw.py http://<ip-edeploy-srv>:80/cgi-bin/upload.py``
+- Or see uploaded ``.hw`` files on the eDeploy server (in ``HWDIR`` directory)
+
+cmdb files
+++++++++++
+
+config/foo.cmdb files are updated during ``make test`` execution. The files will show up add changed in git.
+You can ignore these changes with this command::
+
+    git update-index --assume-unchanged config/kvm-test.cmdb
+
+To revert the configuration, just run::
+
+    git update-index --no-assume-unchanged config/kvm-test.cmdb

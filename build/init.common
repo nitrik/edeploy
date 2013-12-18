@@ -1,3 +1,13 @@
+# -*- shell-script -*-
+
+GIT_REV=""
+
+show_git_rev() {
+    if [ ! -z "$GIT_REV" ]; then
+       echo "Running eDeploy with git hash = $GIT_REV"
+    fi
+}
+
 show_network_cards() {
     # Let's search all devices that have "network" in their class or name
     lspci | grep -wi Network
@@ -23,6 +33,23 @@ save_log() {
     fi
 }
 
+do_reboot() {
+    upload_log
+    reboot -f
+}
+
+do_halt() {
+    upload_log
+    sync
+    sleep 5
+    poweroff -f
+}
+
+do_console() {
+    upload_log
+    exec /bin/bash -i
+}
+
 step() {
     echo "################################################################"
     echo "$@"
@@ -35,6 +62,44 @@ log() {
 
 log_n() {
     echo -n "$@"
+}
+
+upload_log() {
+    if [ "$UPLOAD_LOG" != "1" ]; then
+        return
+    fi
+
+    vendor=$(dmidecode -s system-manufacturer | sed 's/ *$//g' | tr ' ' '-' | tr -d '\n')
+    product=$(dmidecode -s system-product-name | sed 's/ *$//g' | tr ' ' '-' | tr -d '\n')
+    serial=$(dmidecode -s system-serial-number | sed 's/ *$//g' | tr ' ' '-' | tr -d '\n')
+    log_file="${vendor}-${product}-${serial}.log.gz"
+    log "Uploading log ($log_file) to server ${SERV}"
+
+    # Logging the command line to the log file
+    # This is useful to find the context of this execution
+    echo >> /log
+    echo "##### Kernel command line #####" >> /log
+    cat /proc/cmdline >> /log
+    echo "###############################" >> /log
+
+    # Adding content of configure file to the log file we upload
+    # This is interesting when no console can be taken on the server while the /configure fails
+    echo >> /log
+    echo "##### Content of /configure #####" >> /log
+    cat /configure >> /log
+    echo "#################################" >> /log
+
+    echo >> /log
+
+    # Adding also the dmesg to the log we upload
+    # Could be useful to grab some kernel messages or device errors
+    echo "##### Content of dmesg #####" >> /log
+    dmesg >> /log
+    echo "############################" >> /log
+
+    gzip -9 -c /log > /${log_file}
+    # Uploading log file
+    curl -s -S -o/log.stats -F file=@/${log_file} http://${SERV}:${HTTP_PORT}/${HTTP_PATH}/upload.py || true
 }
 
 ################################################################################
@@ -106,9 +171,44 @@ create_keys() {
         "$hostkeys" /etc/ssh/ssh_host_ecdsa_key -t ecdsa
 }
 
+update_ssh_port() {
+    sed -i -e 's/^.*Port.*$/Port 2222/' /etc/ssh/sshd_config
+    sed -i -e 's/^.*#PermitRootLogin.*$/PermitRootLogin yes/' /etc/ssh/sshd_config
+    sed -i -e 's/^.*#PermitEmptyPasswords.*$/PermitEmptyPasswords yes/' /etc/ssh/sshd_config
+}
+
+start_ssh_server() {
+    create_keys
+    update_ssh_port
+    /etc/init.d/ssh start || /etc/init.d/sshd start
+}
+
 give_up() {
     log "$@"
-        exec /bin/bash -i
+    save_log
+    upload_log
+
+    case "$ONFAILURE" in
+      "halt")
+        log "Automatic poweroff as required by ONFAILURE"
+        umount -a
+        do_halt
+        ;;
+      "console")
+        log "ONFAILURE=console, launching an interactive shell"
+        start_ssh_server
+        do_console
+        ;;
+      "reboot")
+        log "Automatic poweroff as required by ONFAILURE"
+        umount -a
+        do_reboot
+        ;;
+      *)
+        log "Unsupported ONFAILURE=$ONFAILURE value"
+        do_console
+        ;;
+    esac
 }
 
 create_main_directories() {
@@ -117,6 +217,7 @@ create_main_directories() {
     [ -d /sys ] || mkdir /sys
     [ -d /proc ] || mkdir /proc
     [ -d /tmp ] || mkdir /tmp
+    [ -d /var/lock/subsys ] || mkdir -p /var/lock/subsys
 }
 
 mount_virtual_fs() {
@@ -157,10 +258,17 @@ probe_pci_devices() {
     # Some kernel drivers doesn't have hardware dependencies but are required to make the device work
     # Let's probe them before starting the network stuff
     step "Probing Additional modules"
-    for module in mlx4_en; do
+    # Show all Mellanox cards (15b3 is hexa vendor ID)
+    if [ "$(lspci -d 15b3: -n|awk '{print $2}'|grep -q '0280';echo $?)" -eq 0 ]; then
+      additional_modules='mlx4_en ib_sa ib_cm ib_umad ib_addr ib_uverbs ib_ipoib ib_ipath mlx4_ib'
+      for module in $additional_modules; do
         log_n "Loading additional module $module "
-        modprobe $module && ( log "done"; echo $module >> /modules) || log "error"
-    done
+        modprobe $module && log "done" || log "error"
+      done
+    fi
+
+    # Add weird sleep to get all drivers probed
+    sleep 5
 }
 
 probe_network_devices() {
@@ -169,7 +277,11 @@ probe_network_devices() {
 DHCP_TIMEOUT=30
 DHCP_GRACE_TIME=10
 DHCP_NO_RACETIMING=1
-sed -i "s/^\#timeout.*/timeout $DHCP_TIMEOUT/g" /etc/dhcp/dhclient.conf
+if [ -f /etc/dhcp/dhclient.conf ]; then
+    sed -i "s/^\#timeout.*/timeout $DHCP_TIMEOUT/g" /etc/dhcp/dhclient.conf
+else
+    echo "timeout $DHCP_TIMEOUT" > /etc/dhcp/dhclient.conf
+fi
 
 MAX_RUN=3
 RUN=0
@@ -252,31 +364,31 @@ while true; do
     fi
     done
 
-    IP_SET=$(ip a  | grep -iw "inet" | grep -v "127.0.0.1" | wc -l)
+    IP_SET=$(ip -4 a  | grep -iw "inet" | grep -v "127.0.0.1" | wc -l)
     if [ "$IP_SET" -gt 0 ]; then
-    log "Found $IP_SET interfaces properly configured"
-    # We found at least once DHCP server so we can continue
-    # the install procedure
-    break
+        log "Found $IP_SET interfaces properly configured"
+        # We found at least once DHCP server so we can continue
+        # the install procedure
+        break
     fi
 
     RUN=$(( $RUN + 1 ))
     sleep 10
     if [ "$RUN" != "$MAX_RUN" ]; then
-    log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    log "!! NO DHCP FOUND ! Waiting 10 seconds before trying again. !!"
-    log "!! ($RUN / $MAX_RUN)                                       !!"
-    log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        log "!! NO DHCP FOUND ! Waiting 10 seconds before trying again. !!"
+        log "!! ($RUN / $MAX_RUN)                                       !!"
+        log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     else
-    log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    log "!! NO DHCP FOUND after $RUN tries. Rebooting in 10 seconds !!"
-    log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    if [ "$DEBUG" != 1 ]; then
-        reboot -f
-    else
-            show_kernel_modules
+        log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        log "!! NO DHCP FOUND after $RUN tries. Rebooting in 10 seconds !!"
+        log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
         give_up "!! DEBUG mode is set, let's give up as no DHCP server found"
     fi
-    fi
 done
+}
+
+set_path() {
+    PATH=/sbin:/bin:/usr/bin:/usr/sbin
+    export PATH
 }

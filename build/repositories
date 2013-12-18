@@ -1,0 +1,227 @@
+add_main_repository() {
+  local dist=$1
+
+  if [ -n "$REPOSITORY" -a "$dist" != redhat ]; then
+    echo "$REPOSITORY"
+    return
+  fi
+
+  case "$dist" in
+    $supported_debian_dists)
+        echo "http://cdn.debian.net/debian"
+        return 0
+    ;;
+    $supported_ubuntu_dists)
+        echo "http://archive.ubuntu.com/ubuntu"
+        return 0
+    ;;
+    $supported_centos_dists)
+        echo "http://mirror.centos.org/centos/6.5/os/x86_64/Packages/centos-release-6-5.el6.centos.11.1.x86_64.rpm"
+        return 0
+    ;;
+    $supported_redhat_dists)
+        if [ -n "$ISO_PATH" ]; then
+            # We use the target variable here since we shall provide the path from the chroot, not from the host
+            echo "${target}/repo/Packages/redhat-release-server-6Server-6.5.0.1.el6.x86_64.rpm"
+        else
+            echo "${REPOSITORY}/Packages/redhat-release-server-6Server-6.5.0.1.el6.x86_64.rpm"
+        fi
+        return 0
+    ;;
+    *)
+        return 1
+    ;;
+  esac
+}
+
+get_openstack_repository() {
+  local dist=$1
+  openstack_release=$2
+
+  if [ -n "$OPENSTACK_REPOSITORY" ]; then
+    echo "$OPENSTACK_REPOSITORY"
+    return
+  fi
+
+  case "$dist" in
+    $supported_debian_dists)
+        echo "deb http://cloud.pkgs.enovance.com/${RELEASE}-${openstack_release}/ ${openstack_release} main"
+        return 0
+    ;;
+    $supported_ubuntu_dists)
+        echo "deb http://cloud.pkgs.enovance.com/${RELEASE}-${openstack_release}/ ${openstack_release} main"
+        return 0
+    ;;
+    $supported_redhat_dists)
+        return 0
+    ;;
+    $supported_centos_dists)
+        current_rpm_release="undef"
+        cloud_init_release="0.7.2-2.el6"
+        case "$openstack_release" in
+            "havana")
+                current_rpm_release=7
+            ;;
+            "grizzly")
+                current_rpm_release=3
+            ;;
+            *)
+                fatal_error "Unsupported openstack release ($openstack_release) for $dist distribution"
+            ;;
+        esac
+        echo "http://rdo.fedorapeople.org/openstack-${openstack_release}/rdo-release-${openstack_release}-${current_rpm_release}.noarch.rpm http://repos.fedorapeople.org/repos/openstack/cloud-init/epel-6/cloud-init-${cloud_init_release}.noarch.rpm"
+        return 0
+    ;;
+    *)
+        return 1
+    ;;
+  esac
+}
+
+
+PUPPET_RELEASE=6-7
+add_puppet_repository() {
+    local dist=$1
+    local dir=$2
+    case "$dist" in
+        $supported_centos_dists|$supported_redhat_dists)
+            install_packages ${dir} http://yum.puppetlabs.com/el/6/products/x86_64/puppetlabs-release-$PUPPET_RELEASE.noarch.rpm
+        ;;
+        *)
+        ;;
+    esac
+}
+
+remove_puppet_repository() {
+    local dist=$1
+    local target=$2
+    case "$dist" in
+        $supported_centos_dists|$supported_redhat_dists)
+            remove_packages $target puppetlabs-release-$PUPPET_RELEASE
+        ;;
+        *)
+        ;;
+    esac
+
+}
+
+
+EPEL_RELEASE=6-8
+add_epel_repository() {
+  local dist=$1
+  local target=$2
+  case "$dist" in
+    $supported_centos_dists|$supported_redhat_dists)
+        install_packages $target http://dl.fedoraproject.org/pub/epel/6/x86_64/epel-release-$EPEL_RELEASE.noarch.rpm
+    ;;
+  *)
+    ;;
+  esac
+}
+
+remove_epel_repository() {
+  local dist=$1
+  local target=$2
+  case "$dist" in
+    $supported_centos_dists|$supported_redhat_dists)
+        remove_packages $target epel-release-$EPEL_RELEASE
+    ;;
+  *)
+    ;;
+  esac
+}
+
+unregister_satellite() {
+    local dist=$1
+    local target=$2
+    local cmd=$MAKEFILE_DIR/remove_system_on_satellite
+
+    # Let's to the basic tests here
+    # This have only a meaning for redhat systems
+    case "$dist" in
+        $supported_redhat_dists)
+
+        # Let's remove the systemid from the chroot
+        if [ -f $target/etc/sysconfig/rhn/systemid ]; then
+            rm -f $target/etc/sysconfig/rhn/systemid || fatal_error "Cannot delete systemid in unregister_satellite()"
+        fi
+
+        if [ ! -x $cmd ]; then
+            fatal_error "$cmd is mandatory to remove the satellite repository"
+        fi
+        # Let's be sure that delete-old-systems-interactive can be run on the system
+        $cmd 2>&1 | grep -qi failed && fatal_error "$cmd is missing dependencies"
+        ;;
+        *)
+        return
+        ;;
+    esac
+
+    do_chroot $target "yum-config-manager --disable rhel-6-server-optional-rpms"
+    remove_packages $target yum-utils
+    $cmd --system=edeploy-$HOSTNAME --user=$SATELLITE_USERNAME --password=$SATELLITE_PASSWORD
+    if [ "$?" != "0" ]; then
+        echo "Failed at removing system from satellite"
+    fi
+}
+
+add_satellite_channel() {
+      local dir=$1
+      local channel=$2
+      yum_channel=$(echo $channel | rev | cut -d "-" -f 2- | rev)
+      yum_channel="${yum_channel}-rpms"
+      do_chroot $dir "rhn-channel --add --channel=$channel -u $SATELLITE_USERNAME -p $SATELLITE_PASSWORD"
+      install_packages $dir "yum-utils"
+      do_chroot $dir "yum-config-manager --enable $yum_channel"
+      update_system $dir
+}
+
+add_satellite_repository() {
+  local dist=$1
+  local target=$2
+  case "$dist" in
+    $supported_redhat_dists)
+      if [ -z "$SATELLITE_USERNAME" ] || [ -z "$SATELLITE_PASSWORD" ]; then
+        echo "You should provide SATELLITE_USERNAME and SATELLITE_PASSWORD to get a satellite support"
+        return
+      fi
+
+      install_packages $target rhn-setup
+      do_chroot $target "rhnreg_ks --profilename=edeploy-$HOSTNAME --username=$SATELLITE_USERNAME --password=$SATELLITE_PASSWORD"
+      add_satellite_channel $target rhel-x86_64-server-optional-6
+      add_satellite_channel $target rhel-x86_64-server-sfs-6
+    ;;
+  *)
+    ;;
+  esac
+}
+
+update_repositories() {
+    CHROOT=$1
+    case "$(package_tool)" in
+        apt)
+            do_chroot $CHROOT apt-get update
+        ;;
+        yum)
+            do_chroot $CHROOT yum check-update || true
+        ;;
+        *)
+            fatal_error "$(package_tool) isn't supported in update_repositories()"
+        ;;
+    esac
+}
+
+disable_repository() {
+    CHROOT=$1
+    repository=$2
+    case "$(package_tool)" in
+        apt)
+        ;;
+        yum)
+            do_chroot $CHROOT yum-config-manager --disable $repository
+        ;;
+        *)
+            fatal_error "$(package_tool) isn't supported in disable_repository()"
+        ;;
+    esac
+}

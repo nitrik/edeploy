@@ -16,6 +16,9 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+# Default behavior if install succeed
+ONSUCCESS="reboot"
+ONFAILURE="halt"
 VERBOSE=0
 
 . init.common
@@ -30,6 +33,8 @@ tpid=$!
 
 ################################################################################
 
+set_path
+
 step "Create directories"
 create_main_directories
 rm -rf /var/lock
@@ -41,6 +46,19 @@ mount_virtual_fs
 eval $(cat /proc/cmdline | tr ' ' "\n" | egrep "^DEBUG=")
 eval $(cat /proc/cmdline | tr ' ' "\n" | egrep "^VERBOSE=")
 eval $(cat /proc/cmdline | tr ' ' "\n" | egrep "^NOREBOOT=")
+eval $(cat /proc/cmdline | tr ' ' "\n" | egrep "^ONSUCCESS=")
+eval $(cat /proc/cmdline | tr ' ' "\n" | egrep "^ONFAILURE=")
+
+#compatibilty module
+if [ "$NOREBOOT" = "1" ]; then
+    log "NOREBOOT option is deprecated, please use ONSUCCESS='kexec'"
+    ONSUCCESS="kexec"
+fi
+
+if [[ "$DEBUG" = "1" ]]; then
+  log "DEBUG param deprecated, please use ONFAILURE=console"
+  ONFAILURE="console"
+fi
 
 if [ "$VERBOSE" = 1 ]; then
     set -x			# show commands
@@ -68,7 +86,7 @@ step "Start Udev"
 # it'll get handled; otherwise it'll get handled later when we do this again
 # in the main boot sequence.
 ( /sbin/udevadm trigger --action=add --subsystem-match=block; \
-  /sbin/udevadm trigger --action=add --subsystem-nomatch=block; ) &
+    /sbin/udevadm trigger --action=add --subsystem-nomatch=block; ) &
 
 ################################################################################
 # Use the system tag to find the role
@@ -84,8 +102,7 @@ probe_pci_devices
 step "Starting networking"
 
 if [ "$DEBUG" = 1 ]; then
-    create_keys
-    /etc/init.d/ssh start
+    start_ssh_server
 fi
 
 probe_network_devices
@@ -123,19 +140,21 @@ show_kernel_modules
 # if there is a match on the server else stop.
 ################################################################################
 
+show_git_rev
+
 step "Configuring system via server ${SERV}"
 curl -s -S -o/configure -F file=@/hw.py http://${SERV}:${HTTP_PORT}/${HTTP_PATH}/upload.py &
-#Saving curl's PID
+# Saving curl's PID
 PID="$!"
 
 log_n "Awaiting eDeploy server :"
-while [ ! -z "$(pidof curl)" ]
-    do log_n "."
+while [ ! -z "$(pidof curl)" ]; do
+    log_n "."
     sleep 1
 done
 log "done"
 
-#Let's grab curl's return code based on it's pid
+# Let's grab curl's return code based on it's pid
 wait $PID
 RET_CODE=$?
 if [ "$RET_CODE" != "0" ]; then
@@ -159,120 +178,167 @@ if /configure; then
     . /vars
 
     if [ -n "$ROLE" -a -n "$VERS" ]; then
-	if [ ! -z "$HSERV" ]; then
-	    log_n "Transfering files from http://${HSERV}/install/${ROLE}-${VERS}.edeploy..."
-	    curl -s -S http://${HSERV}:${HSERV_PORT}/install/${ROLE}-${VERS}.edeploy | gzip -d | tar x -C $d
-	else
-	    log_n "Copying files from rsync://${RSERV}:${RSERV_PORT}/install/${VERS}/${ROLE}..."
-	    rsync -a rsync://${RSERV}:${RSERV_PORT}/install/${VERS}/${ROLE}/ $d/
-	fi
-	echo "SERV=${SERV}" >> $d/var/lib/edeploy/conf
-	echo "RSERV=${RSERV}" >> $d/var/lib/edeploy/conf
-	echo "RSERV_PORT=${RSERV_PORT}" >> $d/var/lib/edeploy/conf
-	log "done"
+        log "Deploying role '$ROLE' version '$VERS' on disk '$DISK' @ $(date)"
+        if [ ! -z "$HSERV" ]; then
+            log_n "Transferring files from http://${HSERV}:${HSERV_PORT}/install/${VERS}/${ROLE}-${VERS}.edeploy..."
+            curl -s -S http://${HSERV}:${HSERV_PORT}/install/${VERS}/${ROLE}-${VERS}.edeploy | gzip -d | tar x -C $d
+        else
+            log_n "Copying files from rsync://${RSERV}:${RSERV_PORT}/install/${VERS}/${ROLE}..."
+            rsync -a rsync://${RSERV}:${RSERV_PORT}/install/${VERS}/${ROLE}/ $d/
+        fi
+        echo "SERV=${SERV}" >> $d/var/lib/edeploy/conf
+        echo "RSERV=${RSERV}" >> $d/var/lib/edeploy/conf
+        echo "RSERV_PORT=${RSERV_PORT}" >> $d/var/lib/edeploy/conf
+        log "done"
 
-	log "Installing post_rsync files"
-	rsync -avHP $p/* $d/
+        log "Installing post_rsync files"
+        rsync -avHP $p/* $d/
 
-	if [ -r /modules ]; then
-	    cat /modules >> $d/etc/modules
-	fi
+        if [ -r /modules ]; then
+            cat /modules >> $d/etc/modules
+        fi
 
-	if [ -n "${METADATA_URL}" ]; then
-	    sed -i -e "s@GRUB_CMDLINE_LINUX_DEFAULT=.*@GRUB_CMDLINE_LINUX_DEFAULT=\"ds=nocloud-net\\\\;s=${METADATA_URL}\"@" $d/etc/default/grub
-	fi
+        if [ -n "${METADATA_URL}" ]; then
+            log "Setting up cloudinit with METADATAURL=$METADATA_URL"
+            sed -i -e "s@GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"@GRUB_CMDLINE_LINUX_DEFAULT=\"\1 ds=nocloud-net\\\\;s=${METADATA_URL}\"@" $d/etc/default/grub
+            BOOT_ARG="$BOOT_ARG ds=nocloud-net;s=${METADATA_URL}"
+        else
+            log "No METADATA_URL variable found, no cloud-init configuration done"
+        fi
 
-	mount -obind /dev $d/dev
-	mount -obind /proc $d/proc
-	mount -obind /sys $d/sys
+        mount -obind /dev $d/dev
+        mount -obind /proc $d/proc
+        mount -obind /sys $d/sys
 
-	if [ -d $d/var/log ]; then
-	    cp -p /log $d/var/log/install.log
-	    cp -p /vars /hw.py $d/var/log/
-	fi
+        if [ -d $d/var/log ]; then
+            cp -p /log $d/var/log/install.log
+            cp -p /vars /hw.py $d/var/log/
+        fi
 
-	#If the disk name doesn't have any /dev/ naming let's add it
-	echo "$DISK" | grep '^/dev/' || DISK="/dev/$DISK"
-	export DISK
-	DISK_BASE=$(basename $DISK)
-	SER=$(cat /sys/block/$DISK_BASE/device/rev)
-	MODEL=$(cat /sys/block/$DISK_BASE/device/model)
-	VENDOR=$(cat /sys/block/$DISK_BASE/device/vendor)
-	echo  "################################################################################################"
-	echo  "# Installing grub  on device ${DISK} which is a $MODEL from $VENDOR with SN=$SER"
-	echo  "################################################################################################"
-	sleep 3
-	if [ -e "${d}/etc/redhat-release" ]; then
-		chroot $d /bin/bash -c "cat /proc/mounts > /etc/mtab"
-		chroot $d /bin/bash -c "/sbin/grub-install ${DISK}"
-		ROOT_DEVICE=`mount | grep /chroot | awk '{print $1}'`
-		eval `blkid $ROOT_DEVICE -o export`
-		echo "default=0"  > ${d}/boot/grub/grub.conf
-		echo "timeout=5" >> ${d}/boot/grub/grub.conf
-		echo "hiddenmenu">> ${d}/boot/grub/grub.conf
-		for kernel in ${d}/boot/vmlinuz-*; do
-			kversion=`echo $kernel | awk -F'vmlinuz-' '{print $NF}'`;
-			KERNEL="/boot/vmlinuz-${kversion}"
-			INITRD="/boot/initramfs-${kversion}.img"
-			TITLE="CentOS (${kversion})"
-			echo "title $TITLE" >> ${d}/boot/grub/grub.conf
-			echo "	root (hd0,0)" >> ${d}/boot/grub/grub.conf
-			echo "	kernel $KERNEL root=UUID=$UUID nomodeset quiet" >> ${d}/boot/grub/grub.conf
-			echo "	initrd $INITRD" >> ${d}/boot/grub/grub.conf
-		done
-		umount $d/sys
-		umount $d/dev
-		umount $d/proc
-		save_log
-		sync
-		if [ "$DEBUG" != 1 ]; then
-			umount -a
-			reboot -f
-		fi
-	elif chroot $d /bin/bash -c "/usr/sbin/grub-install ${DISK}"; then
-			chroot $d /bin/bash -c "/usr/sbin/grub-mkconfig -o /boot/grub/grub.cfg"
-		umount $d/sys
-		umount $d/dev
-		umount $d/proc
-		save_log
-		sync
-		if [ "$DEBUG" != 1 ]; then
-		if [ "$NOREBOOT" = 1 ]; then
-		    if type -p kexec; then
-			echo "Trying kexec..."
-			cp $d/boot/vmlinuz* /tmp/vmlinuz
-			cp $d/boot/initrd.img* /tmp/initrd.img
-			eval $(grep root=UUID= $d/boot/grub/grub.cfg|head -1|tr ' ' '\n'|grep '^root=UUID=')
-			umount $d
-			if [ -z "$root" ]; then
-			    echo "unable to detect root device"
-			else
-			    kexec -l /tmp/vmlinuz --initrd=/tmp/initrd.img --append="root=$root"
-			    kexec -e
-			fi
-		    fi
-		fi
-		umount -a
-		reboot -f
-	    fi
-	else
-	    log "Install of grub failed"
-	fi
+        # If the disk name doesn't have any /dev/ naming let's add it
+        echo "$DISK" | grep '^/dev/' || DISK="/dev/$DISK"
+        export DISK
+        DISK_BASE=$(basename $DISK)
+        SER=$(cat /sys/block/$DISK_BASE/device/rev)
+        MODEL=$(cat /sys/block/$DISK_BASE/device/model)
+        VENDOR=$(cat /sys/block/$DISK_BASE/device/vendor)
+        echo  "################################################################################################"
+        echo  "# Installing grub on device ${DISK} which is a $MODEL from $VENDOR with SN=$SER"
+        echo  "################################################################################################"
+        # grub1 doesn't have /usr/sbin/grub-mkconfig
+        if [ ! -x $d/usr/sbin/grub-mkconfig ]; then
+            chroot $d /bin/sh -c "cat /proc/mounts > /etc/mtab"
+            chroot $d /bin/sh -c "/sbin/grub-install ${DISK}"
+            rm -f $d/etc/mtab
+
+            ret=$?
+            root=`mount | grep "$d " | awk '{print $1}'`
+            eval `blkid $root -o export`
+            echo "default=0"  > ${d}/boot/grub/grub.conf
+            echo "timeout=5" >> ${d}/boot/grub/grub.conf
+            echo "hiddenmenu">> ${d}/boot/grub/grub.conf
+            DEFAULT_BOOT_PARTITION=0
+
+            # Does /boot have a separate partition ?
+            mountpoint -q ${d}/boot
+            NO_BOOT_MOUNTPOINT=$?
+            # Yes it's split, so let's compute its partition number for grub
+            if [ $NO_BOOT_MOUNTPOINT -eq 0 ]; then
+                PART_NUM=$(basename $(grep "${d}/boot" /proc/mounts  | awk '{print $1}')| sed -e 's/[a-z]*\(.*\)/\1/g')
+                DEFAULT_BOOT_PARTITION=$(($PART_NUM - 1))
+            fi
+
+            DISTRO_NAME=$(chroot $d lsb_release -d |  awk '{ print substr($0, index($0,$2)) }')
+            for kernel in ${d}/boot/vmlinuz-*; do
+                kversion=`echo $kernel | awk -F'vmlinuz-' '{print $NF}'`;
+                # If /boot is splitted, we shall not prefix with /boot
+                if [ $NO_BOOT_MOUNTPOINT -eq 0 ]; then
+                    KERNEL="/vmlinuz-${kversion}"
+                    INITRD="/initramfs-${kversion}.img"
+                else
+                    KERNEL="/boot/vmlinuz-${kversion}"
+                    INITRD="/boot/initramfs-${kversion}.img"
+                fi
+                TITLE="$DISTRO_NAME (${kversion})"
+                echo "title $TITLE" >> ${d}/boot/grub/grub.conf
+                echo "	root (hd0,$DEFAULT_BOOT_PARTITION)" >> ${d}/boot/grub/grub.conf
+                echo "	kernel $KERNEL root=UUID=$UUID nomodeset rw $BOOT_ARG" >> ${d}/boot/grub/grub.conf
+                echo "	initrd $INITRD" >> ${d}/boot/grub/grub.conf
+            done
+            # grub 2
+        elif chroot $d /bin/sh -c "/usr/sbin/grub-install ${DISK}"; then
+            chroot $d /bin/sh -c "/usr/sbin/grub-mkconfig -o /boot/grub/grub.cfg"
+            ret=$?
+        else
+            ret=1
+        fi
+
+        # Bootloader successfully installed
+        if [ $ret -eq 0 ]; then
+            umount $d/sys
+            umount $d/dev
+            umount $d/proc
+            save_log
+            sync
+
+            if [ -n "$PXEMNGR_URL" ]; then
+                curl -s ${PXEMNGR_URL}localboot/
+            fi
+
+            case "$ONSUCCESS" in
+                "kexec")
+                    log "Booting with kexec as required by ONSUCCESS"
+                    if type -p kexec; then
+                        log_n "Trying kexec..."
+                        cp $d/boot/vmlinuz* /tmp/vmlinuz
+                        cp $d/boot/initrd.img* /tmp/initrd.img
+                        eval $(grep root=UUID= $d/boot/grub/grub.cfg|head -1|tr ' ' '\n'|grep '^root=UUID=')
+                        if [ -z "$root" ]; then
+                            log_n "using alternative root detection"
+                            root=$(grep 'root=' $d/boot/grub/grub.cfg | grep vmlinuz | head -1 | sed -e 's/.*root=\(.*\)/\1/g' | awk '{print $1}')
+                        fi
+                        umount $d/boot
+                        umount $d
+                        log "."
+                        if [ -z "$root" ]; then
+                            log "unable to detect root device"
+                            give_up "kexec will not be executed"
+                            sleep 5
+                        else
+                            log "About to run kexec with append=root=${root}${BOOT_ARG}"
+                            upload_log
+                            kexec -l /tmp/vmlinuz --initrd=/tmp/initrd.img --append="root=${root}${BOOT_ARG}"
+                            kexec -e
+                        fi
+                    else
+                        give_up "ONSUCCESS=kexec but no kexec found !"
+                    fi
+                    ;;
+                "reboot")
+                    log "Automatic rebooting as required by ONSUCCESS"
+                    umount -a
+                    do_reboot
+                    ;;
+                "halt")
+                    log "Automatic poweroff as required by ONSUCCESS"
+                    umount -a
+                    do_halt
+                    ;;
+                "console")
+                    log "ONSUCCESS=console, launching an interactive shell"
+                    do_console
+                    ;;
+                *)
+                    give_up "Unsupported ONSUCCESS=$ONSUCCESS value"
+                    ;;
+            esac
+        else
+            give_up "Install of grub failed"
+        fi
     else
-	log "No role or version defined..."
+        give_up "No role or version defined..."
     fi
 else
-    log "Problem during system configuration"
     grep '<!-- ' /configure -A 40 >> /log
-fi
-
-save_log
-
-if [ "$DEBUG" = 1 ]; then
-    echo "Debug mode, launching an interactive shell"
-    exec /bin/bash -i
-else
-    echo "Shutting down the system in 10 sec"
-    sleep 10
-    poweroff -f
+    give_up "Problem during system configuration"
 fi

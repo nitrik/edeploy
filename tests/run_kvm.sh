@@ -16,15 +16,16 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-KVM=
+set -e
 DISK=kvm_storage.img
-DISK_SIZE=2000 # in MB
+DISK_SIZE=4000 # in MB
 HTTP_PORT=9000
 INST=$1
 MODE=$2
 LOAD="$3"
 HTTP_SERVER="$4"
-SSH_PORT=2222
+DEBUG_SSH_PORT=2222
+SSH_PORT=222
 PYTHON_PID=0
 RSYNC_PID=0
 LOCKFILE=/tmp/edeploy.lock
@@ -40,13 +41,11 @@ check_binary() {
 }
 
 detect_kvm() {
-	KVM=$(which kvm 2>/dev/null)
-	if [ $? -ne 0 ]; then
-		KVM=$(which qemu-kvm 2>/dev/null)
-		if [ $? -ne 0 ]; then
-			fatal_error "Please Install KVM first"
-		fi
-	fi
+
+    for kvm_bin in kvm qemu-kvm qemu-system-x86_64; do
+        which $kvm_bin 2>/dev/null && return 0
+    done
+	fatal_error "Please Install KVM first"
 }
 
 prepare_disk() {
@@ -60,14 +59,16 @@ run_kvm() {
 	BOOT_DEVICE="n"
 	[ "$1" = "local" ] && BOOT_DEVICE="c"
 
-	$KVM --enable-kvm -m 512\
-		-netdev user,id=net0,net=10.0.2.0/24,tftp=tftpboot,bootfile=/pxelinux.0,hostfwd=tcp::$SSH_PORT-:22 \
+    local kvm_bin=$(detect_kvm)
+
+	$kvm_bin --enable-kvm -m 512\
+		-netdev user,id=net0,net=10.0.2.0/24,tftp=tftpboot,bootfile=/pxelinux.0,hostfwd=tcp::$SSH_PORT-:22,hostfwd=tcp::$DEBUG_SSH_PORT-:$DEBUG_SSH_PORT \
 		-netdev user,id=net1,net=10.0.3.0/24 \
 		-netdev user,id=net2,net=1.2.3.0/24 \
 		-device virtio-net,netdev=net0,mac=52:54:12:34:00:01 \
 		-device virtio-net,netdev=net1,mac=52:54:12:34:00:02 \
 		-device virtio-net,netdev=net2,mac=52:54:12:34:00:03 \
-		-drive file=$DISK,if=virtio,id=drive-virtio-disk0,format=qcow2,cache=none,media=disk,index=0 \
+		-drive file=$DISK,if=virtio,id=drive-virtio-disk0,format=qcow2,cache=writeback,aio=native,media=disk,index=0 \
 		-boot $BOOT_DEVICE \
 		-serial stdio \
 		-smbios type=1,manufacturer=kvm,product=edeploy_test_vm
@@ -106,6 +107,7 @@ start_httpd() {
     fi
 	HTTP_PID=$!
 
+    set +e
     echo "Waiting HTTP server to start"
     RETURN_CODE="7"
     while [ $RETURN_CODE -ne 0 ]; do
@@ -113,16 +115,21 @@ start_httpd() {
          RETURN_CODE="$?"
          sleep .1
     done
+    set -e
     echo "HTTP server started"
 }
 
 stop_httpd() {
-	kill -9 $HTTP_PID &>/dev/null
+    if [ ! -z $HTTP_PID ]; then
+    	kill -9 $HTTP_PID &>/dev/null
+    fi
 	rm -f $LOCKFILE
 }
 
 stop_rsyncd() {
-	kill -9 $RSYNC_PID &>/dev/null
+    if [ ! -z $RSYNC_PID ]; then
+	    kill -9 $RSYNC_PID &>/dev/null
+    fi
 	rm -f rsyncd-edeploy.pid &>/dev/null
 }
 
@@ -144,6 +151,8 @@ create_edeploy_conf() {
 
 HEALTHDIR=$PWD/../health/
 CONFIGDIR=$PWD/../config/
+HWDIR=$PWD/../config/hw
+LOGDIR=$PWD/../config/logs
 LOCKFILE=$LOCKFILE
 USEPXEMNGR=False
 PXEMNGRURL=http://192.168.122.1:8000/
@@ -153,11 +162,23 @@ EOF
 chmod a+rw .
 chmod a+rw $PWD/../health/
 chmod a+rw $PWD/../config/
-chmod a+rw $PWD/../config/*.hw
-chmod a+rw $PWD/../config/state
-chmod a+rw $PWD/../config/kvm-test.cmdb
+chmod a+rw $PWD/../config/hw/
+find $PWD/../config \
+    -maxdepth 1 \
+    -name '*.hw' -or \
+    -name 'state' -or \
+    -name 'kvm-test.cmdb' | xargs chmod a+rw
 
 ln -sf $PWD/edeploy.conf /etc/
+}
+
+tweak_role() {
+    # If no TEST_ROLE is given, let's consider mysql
+    if [ -z "$TEST_ROLE" ]; then
+        TEST_ROLE=mysql
+    fi
+    sed -i "s/set_role.*/set_role('$TEST_ROLE','$VERS',bootable_disk)/g" $PWD/../config/kvm-test.configure
+   #sed -i "s/set_role('mysql', 'D7-F.1.0.0', bootable_disk)
 }
 
 stress-http() {
@@ -281,7 +302,14 @@ printf "  Average waiting : %7.2f seconds\n" $AVERAGE_WAIT_TIME
 printf "  Std deviation   : %7.2f seconds\n" $STD_DEV_WAIT
 }
 
+do_exit() {
+    set +e
+    stop_httpd
+    stop_rsyncd
+}
+
 ############## MAIN
+trap do_exit EXIT
 case "$MODE" in
     "stress-http")
         check_binary curl
@@ -304,11 +332,9 @@ case "$MODE" in
     ;;
     "health")
         setup_pxe
-        detect_kvm
         prepare_disk
         start_httpd
         create_edeploy_conf
-        detect_kvm
         run_kvm
         stop_httpd
     ;;
@@ -316,16 +342,15 @@ case "$MODE" in
         check_binary rsync
         check_binary qemu-img
         check_binary python
-
+        tweak_role
         setup_pxe
         start_rsyncd
         start_httpd
         create_edeploy_conf
-        detect_kvm
         prepare_disk
         run_kvm
+        run_kvm local
         stop_httpd
         stop_rsyncd
-        run_kvm local
     ;;
 esac

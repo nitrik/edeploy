@@ -22,9 +22,96 @@ FROM="$2"
 TO="$3"
 DEST="$4"
 
-ORIG=$(cd $(dirname $0); pwd)
+BUILDDIR=$(cd $(dirname $0); pwd)
 FDIR=${DEST}/install/${FROM}/${ROLE}
 TDIR=${DEST}/install/${TO}/${ROLE}
+METADATA_DIR=${BUILDDIR}/../metadata/${FROM}/${ROLE}/${TO}
+EXCLUDE_FILE=${METADATA_DIR}/exclude
+ADD_ONLY_FILE=${METADATA_DIR}/add_only
+
+. $BUILDDIR/common
+
+# for compatibility with cleanup and common_setup from common
+dir=${TDIR}
+version=${TO}
+
+setup_add_only() {
+    if [ ! -f $ADD_ONLY_FILE ]; then
+        PRIOR_ADD=$(find ${BUILDDIR}/../metadata/*/${ROLE}/${FROM}/add_only || true)
+        if [ ! -z $PRIOR_ADD ]; then
+            echo "Found an add_only file for release ${FROM}"
+            echo "Let's use it as default for this version too"
+            echo "Using $PRIOR_ADD as add_only file"
+            cp $PRIOR_ADD $ADD_ONLY_FILE
+            return
+        fi
+
+        echo "No add_only file found, creating a default one"
+        echo "Please check that $ADD_ONLY_FILE file is featuring all directories or files that need to only added"
+        echo "Any mistake in this file could lead to a bad upgrade path and damage setup"
+        touch $ADD_ONLY_FILE
+        cat >> $ADD_ONLY_FILE << EOF
++ /var/
++ /var/**
+- *
+EOF
+    fi
+}
+setup_exclude() {
+    if [ ! -f $EXCLUDE_FILE ]; then
+        PRIOR_EXCLUDE=$(find ${BUILDDIR}/../metadata/*/${ROLE}/${FROM}/exclude || true)
+        if [ ! -z $PRIOR_EXCLUDE ]; then
+            echo "Found an exclude file for release ${FROM}"
+            echo "Let's use it as default for this version too"
+            echo "Using $PRIOR_EXCLUDE as exclude file"
+            cp $PRIOR_EXCLUDE $EXCLUDE_FILE
+            return
+        fi
+
+        echo "No exclude file found, creating a default one"
+        echo "Please check that $EXCLUDE_FILE file is featuring all directories or files to ignore during rsync"
+        echo "Any mistake in this file could lead to a bad upgrade path and damage setup"
+        touch $EXCLUDE_FILE
+        cat >> $EXCLUDE_FILE << EOF
+/dev/
+/proc/
+/sys/
+/mnt/
+/run/
+/tmp/
+/home/
+/root/
++ /var
+- /var/lib/edeploy/*
+- /var/log/
+- /var/cache/
+/boot/grub/
+/lost+found
+/etc/hostname
+/etc/rc.local*
+/etc/network/
+/etc/fstab
+/etc/mtab
+/etc/shadow
+/etc/ld.so.cache
+/etc/passwd
+/etc/group*
+/etc/hosts
+/etc/resolv.conf
+/etc/ssh/*key
+/etc/ssh/ssh_host*
+/etc/udev/rules.d/*persistent*
+EOF
+    fi
+}
+
+setup_metadata() {
+    if [ ! -d $METADATA_DIR ]; then
+        mkdir -p $METADATA_DIR
+    fi
+    setup_exclude
+    setup_add_only
+}
 
 if [ $# != 4 ]; then
     echo "Usage: $0 <role> <base version> <new version> <top dir>" 1>&2
@@ -36,40 +123,32 @@ if [ ! -d "$FDIR" ]; then
     exit 1
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-
 set -e
-set -x
 
 if [ ! -d ${TDIR} ]; then
     mkdir -p ${TDIR}
-
-    echo -n "Syncing ${FDIR} to ${TDIR}..."
-    rsync -a --delete ${FDIR}/ ${TDIR}/
-    echo "done"
 fi
 
-cleanup() {
-    umount ${TDIR}/dev
-}
+echo -n "Syncing ${FDIR} to ${TDIR}..."
+rsync -a --delete-before ${FDIR}/ ${TDIR}/
+echo "done"
 
-trap cleanup 0
+common_setup
 
-mount -obind /dev ${TDIR}/dev
-chroot ${TDIR} apt-get update
-cp -p ${ORIG}/edeploy ${TDIR}/usr/sbin/
-echo -e "VERS=${TO}\nROLE=${ROLE}\n" > ${TDIR}/var/lib/edeploy/conf
+update_repositories $TDIR
 
-mkdir -p ${TDIR}/etc/default/grub.d
-echo 'exit 0' > ${TDIR}/etc/default/grub.d/edeploy.cfg
+cp -p ${BUILDDIR}/edeploy ${TDIR}/usr/sbin/
 
 script="$BASE".d/${ROLE}_${FROM}_${TO}.upgrade
 
 if [ -x "$script" ]; then
-    "$script" $ROLE $FROM $TO $TDIR
+    dir=$TDIR "$script"
 fi
 
-rm -f ${TDIR}/etc/default/grub.d/edeploy.cfg
+setup_metadata
 
-chroot ${TDIR} apt-get clean
-chroot ${TDIR} dpkg -l > ${TDIR}/../${ROLE}.dpkg
+mkdir -p ${TDIR}/var/lib/edeploy/${TO}
+cp ${METADATA_DIR}/exclude ${TDIR}/var/lib/edeploy/${TO}/exclude
+
+clean_mount_points
+clear_trap

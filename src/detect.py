@@ -18,17 +18,25 @@
 
 '''Main entry point for hardware and system detection routines in eDeploy.'''
 
+
 from commands import getstatusoutput as cmd
+import dellcli
+import diskinfo
+import fcntl
+import hpacucli
+import infiniband as ib
+from netaddr import IPNetwork
 import os
 import pprint
+import socket
+import struct
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
 
-import dellcli
-import diskinfo
-import hpacucli
+
+SIOCGIFNETMASK = 0x891b
 
 
 def size_in_gb(size):
@@ -68,7 +76,12 @@ def detect_hpa(hw_lst):
             sys.stderr.write("Info: No hpa controller found\n")
             return False
 
-        for controller in controllers:
+    except hpacucli.Error as expt:
+        sys.stderr.write('Info: detect_hpa : %s\n' % expt.value)
+        return False
+
+    for controller in controllers:
+        try:
             slot = 'slot=%d' % controller[0]
             for _, disks in cli.ctrl_pd_all_show(slot):
                 for disk in disks:
@@ -77,10 +90,10 @@ def detect_hpa(hw_lst):
                                    str(controller[0])))
                     hw_lst.append(('disk', disk[0], 'size',
                                    size_in_gb(disk[2])))
-        return True
-    except hpacucli.Error as expt:
-        sys.stderr.write('Info: detect_hpa : %s\n' % expt.value)
-        return False
+        except hpacucli.Error as expt:
+            sys.stderr.write('Info: detect_hpa : controller %d : %s\n' % (controller[0], expt.value))
+
+    return True
 
 
 def detect_disks(hw_lst):
@@ -134,19 +147,76 @@ def detect_ipmi(hw_lst):
             status, _ = cmd('ipmitool channel info %d 2>&1 | grep -sq Volatile'
                             % channel)
             if status == 0:
-                hw_lst.append(('system', 'ipmi', 'channel', channel))
+                hw_lst.append(('system', 'ipmi', 'channel', '%s' % channel))
                 break
     else:
         # do we need a fake ipmi device for testing purpose ?
         status, _ = cmd('grep -qi FAKEIPMI /proc/cmdline')
         if status == 0:
             # Yes ! So let's create a fake entry
-            hw_lst.append(('system', 'ipmi-fake', 'channel', 0))
+            hw_lst.append(('system', 'ipmi-fake', 'channel', '0'))
             sys.stderr.write('Info: Added fake IPMI device\n')
             return True
         else:
             sys.stderr.write('Info: No IPMI device found\n')
             return False
+
+
+def get_cidr(netmask):
+    'Convert a netmask to a CIDR.'
+    binary_str = ''
+    for octet in netmask.split('.'):
+        binary_str += bin(int(octet))[2:].zfill(8)
+    return str(len(binary_str.rstrip('0')))
+
+
+def detect_infiniband(hw_lst):
+    'Detect Infiniband devinces.'
+    'To detect if an IB device is present, we search for a pci device'
+    'This pci device shall be from vendor Mellanox (15b3) form class 0280'
+    'Class 280 stands for a Network Controller while ethernet device are 0200'
+    status, _ = cmd("lspci -d 15b3: -n|awk '{print $2}'|grep -q '0280'")
+    if status == 0:
+        ib_card = 0
+        for devices in range(ib_card, len(ib.ib_card_drv())):
+            card_type = ib.ib_card_drv()[devices]
+            ib_infos = ib.ib_global_info(card_type)
+            nb_ports = ib_infos['nb_ports']
+            hw_lst.append(('infiniband', 'card%i' % ib_card,
+                           'card_type', card_type))
+            hw_lst.append(('infiniband', 'card%i' % ib_card,
+                           'device_type', ib_infos['device_type']))
+            hw_lst.append(('infiniband', 'card%i' % ib_card,
+                           'fw_version', ib_infos['fw_ver']))
+            hw_lst.append(('infiniband', 'card%i' % ib_card,
+                           'hw_version', ib_infos['hw_ver']))
+            hw_lst.append(('infiniband', 'card%i' % ib_card,
+                           'nb_ports', nb_ports))
+            hw_lst.append(('infiniband', 'card%i' % ib_card,
+                           'sys_guid', ib_infos['sys_guid']))
+            hw_lst.append(('infiniband', 'card%i' % ib_card,
+                           'node_guid', ib_infos['node_guid']))
+            for port in range(1, int(nb_ports)+1):
+                ib_port_infos = ib.ib_port_info(card_type, port)
+                hw_lst.append(('infiniband', 'card%i_port%i' % (ib_card, port),
+                               'state', ib_port_infos['state']))
+                hw_lst.append(('infiniband', 'card%i_port%i' % (ib_card, port),
+                               'physical_state',
+                               ib_port_infos['physical_state']))
+                hw_lst.append(('infiniband', 'card%i_port%i' % (ib_card, port),
+                               'rate', ib_port_infos['rate']))
+                hw_lst.append(('infiniband', 'card%i_port%i' % (ib_card, port),
+                               'base_lid', ib_port_infos['base_lid']))
+                hw_lst.append(('infiniband', 'card%i_port%i' % (ib_card, port),
+                               'lmc', ib_port_infos['lmc']))
+                hw_lst.append(('infiniband', 'card%i_port%i' % (ib_card, port),
+                               'sm_lid', ib_port_infos['sm_lid']))
+                hw_lst.append(('infiniband', 'card%i_port%i' % (ib_card, port),
+                               'port_guid', ib_port_infos['port_guid']))
+        return True
+    else:
+        sys.stderr.write('Info: No Infiniband device found\n')
+        return False
 
 
 def detect_system(hw_lst, output=None):
@@ -162,8 +232,12 @@ def detect_system(hw_lst, output=None):
             if attrib:
                 hw_lst.append((sys_cls, sys_type, sys_subtype,
                                elt[0].attrib[attrib]))
+                return elt[0].attrib[attrib]
             else:
                 hw_lst.append((sys_cls, sys_type, sys_subtype, elt[0].text))
+                return elt[0].text
+        return None
+
     # handle output injection for testing purpose
     if output:
         status = 0
@@ -211,16 +285,55 @@ def detect_system(hw_lst, output=None):
         for elt in xml.findall(".//node[@class='network']"):
             name = elt.find('logicalname')
             if name is not None:
-                find_element(elt, 'serial', 'serial', name.text, 'network')
+                # lshw is not able to get the complete mac addr for ib
+                # devices Let's workaround it with an ip command.
+                if name.text.startswith('ib'):
+                    cmds = "ip addr show %s | grep link | awk '{print $2}'"
+                    status_ip, output_ip = cmd(cmds % name.text)
+                    hw_lst.append(('network',
+                                   name.text,
+                                   'serial',
+                                   output_ip.split('\n')[0]))
+                else:
+                    find_element(elt, 'serial', 'serial', name.text, 'network')
+
                 find_element(elt, 'vendor', 'vendor', name.text, 'network')
                 find_element(elt, 'product', 'product', name.text, 'network')
                 find_element(elt, 'size', 'size', name.text, 'network')
-                find_element(elt, "configuration/setting[@id='ip']", 'ipv4',
-                             name.text, 'network', 'value')
+                ipv4 = find_element(elt, "configuration/setting[@id='ip']",
+                                    'ipv4',
+                                    name.text, 'network', 'value')
+                if ipv4 is not None:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    try:
+                        netmask = socket.inet_ntoa(
+                            fcntl.ioctl(sock, SIOCGIFNETMASK,
+                                        struct.pack('256s', name.text))[20:24])
+                        hw_lst.append(
+                            ('network', name.text, 'ipv4-netmask', netmask))
+                        cidr = get_cidr(netmask)
+                        hw_lst.append(
+                            ('network', name.text, 'ipv4-cidr', cidr))
+                        hw_lst.append(
+                            ('network', name.text, 'ipv4-network',
+                             "%s" % IPNetwork('%s/%s' % (ipv4, cidr)).network))
+                    except Exception:
+                        sys.stderr.write('unable to get info for %s\n'
+                                         % name.text)
+
                 find_element(elt, "configuration/setting[@id='link']", 'link',
                              name.text, 'network', 'value')
                 find_element(elt, "configuration/setting[@id='driver']",
                              'driver', name.text, 'network', 'value')
+                find_element(elt, "configuration/setting[@id='duplex']",
+                             'duplex', name.text, 'network', 'value')
+                find_element(elt, "configuration/setting[@id='speed']",
+                             'speed', name.text, 'network', 'value')
+                find_element(elt, "configuration/setting[@id='latency']",
+                             'latency', name.text, 'network', 'value')
+                find_element(elt,
+                             "configuration/setting[@id='autonegotiation']",
+                             'autonegotiation', name.text, 'network', 'value')
 
         for elt in xml.findall(".//node[@class='processor']"):
             name = elt.find('physid')
@@ -248,10 +361,10 @@ def detect_system(hw_lst, output=None):
     else:
         sys.stderr.write("Unable to run lshw: %s\n" % output)
 
-    hw_lst.append(('cpu', 'physical', 'number', socket_count))
+    hw_lst.append(('cpu', 'physical', 'number', str(socket_count)))
     status, output = cmd('nproc')
     if status == 0:
-        hw_lst.append(('cpu', 'logical', 'number', output))
+        hw_lst.append(('cpu', 'logical', 'number', str(output)))
 
 
 def detect_vendor():
@@ -273,6 +386,7 @@ def _main():
     detect_disks(hrdw)
     detect_system(hrdw)
     detect_ipmi(hrdw)
+    detect_infiniband(hrdw)
     pprint.pprint(hrdw)
 
 if __name__ == "__main__":

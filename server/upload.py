@@ -25,7 +25,7 @@ a Python configuration script corresponding to the matched config.
 If nothing matches, nothing is returned. So the system can abort
 its configuration.
 
-On the to be configured host, it is usally called like that:
+On the to be configured host, it is usually called like that:
 
 $ curl -i -F name=test -F file=@/tmp/hw.lst http://localhost/cgi-bin/upload.py
 '''
@@ -238,7 +238,8 @@ def save_hw(items, name, hwdir):
 
 def register_pxemngr(sysvars):
     'Register the system in pxemngr.'
-    macs = ' '.join(sysvars['serial'])
+    # only use Ethernet mac addresses with pxemngr
+    macs = ' '.join(filter(lambda x: len(x) == 17, sysvars['serial']))
     cmd = 'pxemngr addsystem %s %s' % (sysvars['sysname'],
                                        macs)
     status, output = commands.getstatusoutput(cmd)
@@ -307,6 +308,7 @@ exit 1
 ''' % error)
     sys.stderr.write('%s\n' % error)
 
+
 def fatal_error(error):
     '''Report a shell script with the error message and log
     the message on stderr.'''
@@ -327,10 +329,14 @@ def main():
         except (ConfigParser.NoOptionError, ConfigParser.NoSectionError):
             return default
 
-    cfg_dir = os.path.normpath(config_get('SERVER', 'CONFIGDIR',
-            os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                         '..',
-                         'config'))) + '/'
+    cfg_dir = os.path.normpath(config_get(
+        'SERVER', 'CONFIGDIR',
+        os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                     '..',
+                     'config'))) + '/'
+
+    hw_dir = os.path.normpath(config_get(
+        'SERVER', 'HWDIR', cfg_dir)) + '/'
 
     # parse hw file given in argument or passed to cgi script
     if len(sys.argv) == 3 and sys.argv[1] == '-f':
@@ -342,6 +348,26 @@ def main():
 
         print "Content-Type: text/x-python"     # HTML is following
         print                                   # blank line, end of headers
+
+        # If the filename ends with a .log, we need to process it as a log file
+        if ('file' in form) and (form['file'].filename.endswith('.log.gz')):
+            logitem = form['file']
+            logfile = logitem.file
+            try:
+                # Let's save the file in LOGDIR directory
+                log_dir = os.path.normpath(config_get('SERVER', 'LOGDIR', cfg_dir)) + '/'
+                filename = os.path.join(log_dir, logitem.filename)
+                output_file = open(filename, 'w')
+                output_file.write(logfile.read(-1))
+                output_file.close()
+            except Exception, xcpt:
+                # If we fails at saving, let's exit
+                fatal_error("exception while saving log file: %s" % str(xcpt))
+                sys.exit(1)
+            # If the succeed at saving log file, let's also exit
+            # In fact we have nothing more to do once its saved.
+            log('Log file %s saved' % logitem.filename)
+            sys.exit(0)
 
         if not 'file' in form:
             fatal_error('No file passed to the CGI')
@@ -365,7 +391,7 @@ def main():
     atexit.register(cleanup)
 
     filename_and_macs = generate_filename_and_macs(hw_items)
-    save_hw(hw_items, filename_and_macs['sysname'], cfg_dir)
+    save_hw(hw_items, filename_and_macs['sysname'], hw_dir)
 
     use_pxemngr = (config_get('SERVER', 'USEPXEMNGR', False) == 'True')
     pxemngr_url = config_get('SERVER', 'PXEMNGRURL', None)
@@ -381,7 +407,7 @@ def main():
     times = '*'
     name = None
     for name, times in names:
-        if times == '*' or times > 0:
+        if times == '*' or int(times) > 0:
             specs = eval(open(cfg_dir + name + '.specs', 'r').read(-1))
             var = {}
             var2 = {}
@@ -397,14 +423,14 @@ def main():
         var2 = var
 
     if times != '*':
-        names[idx] = (name, times - 1)
+        names[idx] = (name, int(times) - 1)
 
     cmdb = load_cmdb(cfg_dir, name)
     if cmdb:
         if not update_cmdb(cmdb, var, var2, forced):
             sys.exit(1)
         save_cmdb(cfg_dir, name, cmdb)
-
+    var['edeploy-profile'] = name
     cfg = open(cfg_dir + name + '.configure').read(-1)
 
     sys.stdout.write('''#!/usr/bin/env python
@@ -439,9 +465,9 @@ var = ''')
 
     sys.stdout.write(cfg)
 
-    if use_pxemngr:
+    if use_pxemngr and pxemngr_url:
         print '''
-run('curl -s %slocalboot/')
+run('echo "PXEMNGR_URL=%s" >> /vars')
 ''' % pxemngr_url
 
     if metadata_url:
