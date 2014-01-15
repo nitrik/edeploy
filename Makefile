@@ -34,6 +34,7 @@ install-www:
 	sed -i -e "s|^CONFIGDIR=.*|CONFIGDIR=$(WWW_CONF_DIR)|" $(ETC_DIR)/edeploy.conf
 	sed -i -e "s|^LOGDIR=.*|LOGDIR=$(WWW_LOG_DIR)|" $(ETC_DIR)/edeploy.conf
 	sed -i -e "s|^HWDIR=.*|HWDIR=$(WWW_HW_DIR)|" $(ETC_DIR)/edeploy.conf
+	sed -i -e "s|^HEALTHDIR=.*|HEALTHDIR=$(WWW_HL_DIR)|" $(ETC_DIR)/edeploy.conf
 
 install-build:
 	mkdir -p $(SHARE_BUILD_DIR) && chmod 755 $(SHARE_BUILD_DIR)
